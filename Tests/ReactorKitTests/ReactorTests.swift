@@ -14,8 +14,58 @@ final class ReactorTests: XCTestCase {
     test.assert(reactor.state) { events in
       XCTAssertEqual(events.elements.count, 2)
       XCTAssertEqual(events.elements[0], ["transformedState"]) // initial state
-      XCTAssertEqual(events.elements[1], ["action", "transformedAction", "mutation", "transformedMutation", "transformedState"])
+      XCTAssertEqual(events.elements[1], ["action", "transformedAction", "mutation", "transformedMutation", "reduce", "transformedState"])
     }
+  }
+
+  func testReduceIsExecutedRightAfterMutation() {
+    final class MyReactor: Reactor {
+      enum Action {
+        case append([String])
+      }
+
+      enum Mutation {
+        case setCharacters([String])
+      }
+
+      struct State {
+        var characters: [String] = []
+      }
+
+      let initialState = State()
+
+      func mutate(action: Action) -> Observable<Mutation> {
+        switch action {
+        case let .append(characters):
+          let sources: [Observable<Mutation>] = characters.map { character in
+            Observable<Mutation>.create { [weak self] observer in
+              if let self = self {
+                let newCharacters = self.currentState.characters + [character]
+                observer.onNext(Mutation.setCharacters(newCharacters))
+              }
+              observer.onCompleted()
+              return Disposables.create()
+            }
+          }
+          return Observable.concat(sources)
+        }
+      }
+
+      func reduce(state: State, mutation: Mutation) -> State {
+        var newState = state
+        switch mutation {
+        case let .setCharacters(newCharacters):
+          newState.characters = newCharacters
+        }
+        return newState
+      }
+    }
+
+    let reactor = MyReactor()
+    reactor.action.onNext(.append(["a", "b"]))
+    reactor.action.onNext(.append(["c"]))
+    reactor.action.onNext(.append(["d", "e", "f"]))
+    XCTAssertEqual(reactor.currentState.characters, ["a", "b", "c", "d", "e", "f"])
   }
 
   func testStateReplayCurrentState() {
@@ -34,13 +84,13 @@ final class ReactorTests: XCTestCase {
     let reactor = TestReactor()
     _ = reactor.state
     reactor.action.onNext(["action"])
-    XCTAssertEqual(reactor.currentState, ["action", "transformedAction", "mutation", "transformedMutation", "transformedState"])
+    XCTAssertEqual(reactor.currentState, ["action", "transformedAction", "mutation", "transformedMutation", "reduce", "transformedState"])
   }
 
   func testCurrentState_stateIsCreatedWhenAccessAction() {
     let reactor = TestReactor()
     reactor.action.onNext(["action"])
-    XCTAssertEqual(reactor.currentState, ["action", "transformedAction", "mutation", "transformedMutation", "transformedState"])
+    XCTAssertEqual(reactor.currentState, ["action", "transformedAction", "mutation", "transformedMutation", "reduce", "transformedState"])
   }
 
   func testStreamIgnoresErrorFromAction() {
@@ -158,14 +208,14 @@ final class ReactorTests: XCTestCase {
 
   func testStub_actionAndStateMemoryAddress() {
     let reactor = TestReactor()
-    reactor.stub.isEnabled = true
+    reactor.isStubEnabled = true
     XCTAssertTrue(reactor.action === reactor.stub.action)
     XCTAssertTrue(reactor.state === reactor.stub.state.asObservable())
   }
 
   func testStub_actions() {
     let reactor = StopwatchReactor(scheduler: MainScheduler.instance)
-    reactor.stub.isEnabled = true
+    reactor.isStubEnabled = true
     reactor.action.onNext(.start)
     reactor.action.onNext(.start)
     reactor.action.onNext(.stop)
@@ -174,7 +224,7 @@ final class ReactorTests: XCTestCase {
 
   func testStub_state() {
     let reactor = StopwatchReactor(scheduler: MainScheduler.instance)
-    reactor.stub.isEnabled = true
+    reactor.isStubEnabled = true
     reactor.stub.state.value = 0
     XCTAssertEqual(reactor.currentState, 0)
     reactor.stub.state.value = 1
@@ -187,7 +237,7 @@ final class ReactorTests: XCTestCase {
 
   func testStub_ignoreAction() {
     let reactor = TestReactor()
-    reactor.stub.isEnabled = true
+    reactor.isStubEnabled = true
     reactor.action.onNext(["A"])
     XCTAssertEqual(reactor.currentState, [])
   }
@@ -237,6 +287,23 @@ final class ReactorTests: XCTestCase {
     reactor.action.onNext(.foo)
     XCTAssertEqual(reactor.currentState, 1)
   }
+
+  func testDispose() {
+    weak var weakReactor: TestReactor?
+    weak var weakAction: ActionSubject<TestReactor.Action>?
+    weak var weakState: Observable<TestReactor.State>?
+
+    _ = {
+      let reactor = TestReactor()
+      weakReactor = reactor
+      weakAction = reactor.action
+      weakState = reactor.state
+    }()
+
+    XCTAssertNil(weakReactor)
+    XCTAssertNil(weakAction)
+    XCTAssertNil(weakState)
+  }
 }
 
 struct TestError: Error {
@@ -264,12 +331,12 @@ private final class TestReactor: Reactor {
     return mutation.map { $0 + ["transformedMutation"] }
   }
 
-  // 4. [] + ["action", "transformedAction", "mutation", "transformedMutation"]
+  // 4. [] + ["action", "transformedAction", "mutation", "transformedMutation"] + ["reduce"]
   func reduce(state: State, mutation: Mutation) -> State {
-    return state + mutation
+    return state + mutation + ["reduce"]
   }
 
-  // 5. ["action", "transformedAction", "mutation", "transformedMutation"] + ["transformedState"]
+  // 5. ["action", "transformedAction", "mutation", "transformedMutation", "reduce"] + ["transformedState"]
   func transform(state: Observable<State>) -> Observable<State> {
     return state.map { $0 + ["transformedState"] }
   }
@@ -295,7 +362,7 @@ private final class StopwatchReactor: Reactor {
     switch action {
     case .start:
       let stopAction = self.action.filter { $0 == .stop }
-      return Observable<Int>.interval(1, scheduler: self.scheduler)
+      return Observable<Int>.interval(.seconds(1), scheduler: self.scheduler)
         .map { _ in 1 }
         .takeUntil(stopAction)
 
